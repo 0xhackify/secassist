@@ -77,14 +77,42 @@ class Workspace:
         self.event('finding_saved', finding_id=item['id'], source=source)
         return item
 
-    def confirm(self, finding_id):
-        items = self.findings()
-        item = next((x for x in items if x['id'] == finding_id), None)
+    def finding(self, finding_id):
+        item = next((x for x in self.findings() if x['id'] == finding_id), None)
         if item is None:
             raise ValueError('Unknown finding ID')
-        item['status'] = 'user_confirmed'
-        atomic_json(self.findings_file, items)
-        self.event('finding_confirmed', finding_id=finding_id)
+        return item
+
+    def _update_finding(self, finding_id, event, **changes):
+        """Human-only decisions; findings are never deleted so the audit trail stays complete."""
+        with self.lock:
+            items = self.findings()
+            item = next((x for x in items if x['id'] == finding_id), None)
+            if item is None:
+                raise ValueError('Unknown finding ID')
+            item.update(changes)
+            atomic_json(self.findings_file, items)
+        self.event(event, finding_id=finding_id, **changes)
+        return item
+
+    def confirm(self, finding_id):
+        return self._update_finding(finding_id, 'finding_confirmed', status='user_confirmed')
+
+    def reject(self, finding_id, reason=''):
+        return self._update_finding(finding_id, 'finding_rejected', status='rejected',
+                                    rejection=redact(reason.strip()))
+
+    def set_severity(self, finding_id, severity):
+        if severity not in SEVERITIES:
+            raise ValueError('Severity must be one of: ' + ', '.join(SEVERITIES))
+        return self._update_finding(finding_id, 'finding_severity_changed', severity=severity,
+                                    severity_set_by='operator')
+
+    def evidence_intact(self, source):
+        manifest = read_json(self.root / 'evidence.json', {})
+        p = self.resolve(source)
+        return bool(p and source in manifest and
+                    hashlib.sha256(p.read_bytes()).hexdigest() == manifest[source]['sha256'])
 
     def findings_summary(self, limit=25):
         return '\n'.join(f"#{x['id']} [{x['severity']}/{x.get('status', 'legacy_unreviewed')}] {x['title']}"

@@ -1,6 +1,7 @@
 """Persistent CLI scope. Argument checking is not a network sandbox."""
 import hashlib
 import ipaddress
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
@@ -110,6 +111,24 @@ def extract_targets(args):
     return targets
 
 
+SYSTEM_DATA = '/usr/share'
+
+
+def readable(value, roots):
+    """The path as written must be under a root; after symlinks it must stay under a root or system data.
+    Kali links /usr/share/wordlists/dirb to /usr/share/dirb/wordlists, so resolving alone is not enough."""
+    path = Path(value).expanduser()
+    written = Path(os.path.abspath(path))
+    lexical = False
+    for root in roots:
+        try:
+            written.relative_to(os.path.abspath(Path(root).expanduser()))
+            lexical = True
+        except ValueError:
+            continue
+    return lexical and any(inside(path, r) for r in [*roots, SYSTEM_DATA])
+
+
 def local_file_warnings(args, allowed_roots):
     warnings = []
     for arg in args:
@@ -117,6 +136,11 @@ def local_file_warnings(args, allowed_roots):
         value = value.lstrip('@')
         path = Path(value).expanduser()
         if ('/' in value or '\\' in value) and '://' not in value and not value.startswith('//'):
-            if not any(inside(path, r) for r in allowed_roots):
+            try:
+                ipaddress.ip_network(value, strict=False)
+                continue  # CIDR notation, scope-checked as a target rather than read as a path
+            except ValueError:
+                pass
+            if not readable(path, allowed_roots):
                 warnings.append(f'Local path requires review: {value}')
     return warnings

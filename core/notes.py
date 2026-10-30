@@ -5,7 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 NOTE_EXTENSIONS = {".md", ".txt", ".markdown", ".rst", ".conf", ".py", ".sh", ".ps1"}
-TOKEN_RE = re.compile(r"[a-z0-9_]+(?:[.\-/][a-z0-9_]+)*|[؀-ۿ]+")
+TOKEN_RE = re.compile(r"[a-z0-9_]+(?:[.\-/][a-z0-9_]+)*|[\u0600-\u06ff]+")  # notes may be non-English
 
 
 def tokenize(text):

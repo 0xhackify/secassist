@@ -35,7 +35,8 @@ class ChatClient:
         }
         if self.thinking == "off":
             payload["thinking"] = {"type": "disabled"}
-            payload["temperature"] = 0.3
+            # Most repeatable sampling. Thinking mode ignores temperature and has no seed.
+            payload["temperature"] = 0
         else:
             payload["thinking"] = {"type": "enabled"}
             payload["reasoning_effort"] = self.thinking

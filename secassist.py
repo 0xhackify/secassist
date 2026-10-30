@@ -17,17 +17,24 @@ from core import __version__, ui
 from core.agent import Agent
 from core.client import ChatClient, THINKING_LEVELS
 from core.jobs import JobManager
+from core.methodology import PHASES
 from core.notes import NotesIndex
 from core.policy import Policy, MODES
+from core.report import html_page, markdown
 from core.scope import Scope, normalize
 from core.storage import atomic_json, read_json, redact
 from core.terminal import Terminal
+from core.toolcheck import ToolCheck, wordlists
 from core.tools import REGISTRY
-from core.workspace import Workspace
+from core.workspace import SEVERITIES, Workspace
+
+STATUS_COLORS = {'completed': ui.GREEN, 'running': ui.CYAN, 'ready': ui.YELLOW, 'failed': ui.RED,
+                 'blocked': ui.RED, 'pending': ui.DIM, 'skipped': ui.DIM, 'not_applicable': ui.DIM,
+                 'manual': ui.MAGENTA}
 
 HERE = Path(__file__).resolve().parent
 HELP = """
-SecAssist 3 — Arabic/English evidence-led assessment assistant
+SecAssist 3 — evidence-led security assessment assistant
 /target HOST            select target; asks to authorize it if new
 /scope                  list scope
 /scope add TARGET       authorize IP/CIDR/domain/*.domain/URL
@@ -38,6 +45,12 @@ SecAssist 3 — Arabic/English evidence-led assessment assistant
 /mode ask               confirm every command (default)
 /mode auto RISK MIN N   grant risk ceiling for MIN minutes and N commands
                        RISK: recon | active | intrusive; never bypass scope
+/methodology            phases, every playbook step, its status and reason
+/next                   run the next ready methodology steps in their fixed order
+/skip STEP [REASON]     operator skips a step; it is reported as not tested
+/retry STEP             reset a failed, blocked or skipped step
+/facts                  service inventory parsed from nmap XML
+/wordlists              installed wordlists the playbooks and assistant use
 /run TOOL ARGS          managed command, follows mode/approval
 /jobs                   IDs, states, outputs
 /watch ID               live output (Ctrl+C returns; does not stop job)
@@ -47,12 +60,15 @@ SecAssist 3 — Arabic/English evidence-led assessment assistant
 /parallel 1..4          limit running jobs; default 2
 /panes on|off           adjacent tmux output/status panes
 /plan                   show evidence-led assessment plan
-/findings               show suspected / user-confirmed findings
+/findings               show suspected / user-confirmed / rejected findings
+/finding ID             full finding: description, evidence quote, integrity check
 /confirm ID             human confirms a finding after reviewing evidence
+/reject ID [REASON]     human marks a finding as a false positive (kept for audit)
+/severity ID LEVEL      human sets severity: info | low | medium | high | critical
 /outputs                list registered evidence
 /import PATH            copy local evidence to target
 /file PATH QUESTION     import then ask AI (sends evidence to API)
-/report                 factual local Markdown + JSON export; no API call
+/report                 factual local Markdown + HTML + JSON export; no API call
 /resume                 restore history for current target; approvals reset
 /clear                  clear conversation, keep evidence
 /notes QUERY            local notes search
@@ -80,7 +96,7 @@ class App:
                                  args.model or self.config.get('model', 'deepseek-flash'),
                                  args.think or self.config.get('think', 'high'))
         self.scope = Scope(self.data / 'scope.json')
-        self.policy = Policy(self.scope)
+        self.policy = Policy(self.scope, ToolCheck())
         self.policy.mode = args.mode
         self.notes = NotesIndex(args.notes)
         self.notified = set()
@@ -105,7 +121,7 @@ class App:
     def banner(self):
         print(ui.c(f'SecAssist {__version__}', ui.BOLD, ui.CYAN))
         print(f'Target={self.ws.target} | mode={self.policy.mode} | model={self.client.model} | parallel={self.jobs.max_jobs}')
-        print('أضف الهدف بـ /target أو /scope add. الوضع ask يطلب موافقتك لكل أمر.')
+        print('Set a target with /target or /scope add. Mode ask requires approval for every command.')
         print('AI inputs/evidence go to the configured API. /setup for key; /help for commands.')
         print('API secrets stay in memory/environment; tool arguments/outputs are saved locally.')
         if not self.client.api_key:
@@ -208,7 +224,44 @@ class App:
                 'purpose': 'Explicit operator command; inspect targets/options below.',
                 'expected': 'Tool output; success/failure alone is not vulnerability proof.',
                 'stop_condition': 'Completion, timeout, output cap, or /stop.'}
-        print(self.agent.run(card))
+        print(self.agent.run(card, source='operator'))
+
+    def methodology(self):
+        method = self.agent.method
+        if not method.active():
+            raise ValueError('Select a target first: /target HOST')
+        method.sync(self.jobs)
+        rows, phase = method.evaluate()
+        print(' > '.join(ui.c(p.upper(), ui.BOLD, ui.CYAN) if p == phase else p for p in PHASES))
+        width = max([len(s.id) for s, _, _ in rows] + [10])
+        for step, status, reason in rows:
+            print(f"{ui.c(f'{status:<15}', STATUS_COLORS.get(status, ui.DIM))}{step.id:<{width + 2}}"
+                  f"{step.tool or '-':<15}{redact(reason)}")
+        if not method.facts.services() and any(s.id == 'discovery.top-ports' and st == 'completed' for s, st, _ in rows):
+            print('No open ports in the inventory.')
+        ready = sum(1 for _, st, _ in rows if st == 'ready')
+        print(f'{ready} ready: /next runs them in order. /skip STEP [REASON] · /retry STEP · /facts')
+
+    def next_steps(self):
+        if not self.agent.method.active():
+            raise ValueError('Select a target first: /target HOST')
+        self.agent.stopped = False
+        results = self.agent.advance()
+        print('\n'.join(results) or 'No ready steps. /methodology shows what is running, pending or blocked.')
+
+    def pump(self):
+        """Auto mode on POSIX: launch steps the grant covers, then analyze finished jobs. True if it printed."""
+        if self.policy.mode != 'auto' or not self.agent.method.active():
+            return False
+        self.agent.stopped = False
+        started = self.agent.advance(unattended=True)
+        if started:
+            ui.info('\n'.join(started))
+        if self.completed():
+            print()
+            self.continue_run()
+            return True
+        return bool(started)
 
     def completed(self):
         return [j for j in self.jobs.jobs.values() if j.done.is_set() and j.id not in self.notified]
@@ -273,35 +326,32 @@ class App:
             if not t.binary():
                 print(f'  Install: sudo apt install {t.apt}')
 
+    def show_finding(self, finding_id):
+        f = self.ws.finding(finding_id)
+        intact = 'yes' if self.ws.evidence_intact(f['source']) else 'NO: source changed or missing; review it again'
+        lines = [f"severity: {f['severity']} | status: {f.get('status')}",
+                 f"source: {f['source']} | evidence file unchanged: {intact}", '', f['description'], '',
+                 'Evidence (verbatim quote):', f['evidence'], '', 'Remediation: ' + f['remediation']]
+        if f.get('status') == 'rejected':
+            lines.append('Rejected: ' + (f.get('rejection') or 'no reason given'))
+        ui.box(redact(f"Finding #{f['id']} {f['title']}"), redact('\n'.join(lines)).splitlines())
+
     def report(self):
-        findings = self.ws.findings()
-        plan = read_json(self.ws.root / 'plan.json', [])
-        evidence = read_json(self.ws.root / 'evidence.json', {})
-        jobs = [j.record() for j in self.jobs.jobs.values()]
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        self.agent.method.sync(self.jobs)
+        services = [{'address': a, 'port': k, **info} for a, k, info in self.agent.method.facts.services()]
         data = {'target': self.ws.target, 'scope': self.scope.describe(),
+                'methodology': self.agent.method.coverage(), 'services': services,
                 'generated_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                'findings': findings, 'plan': plan, 'evidence': evidence, 'current_process_jobs': jobs}
+                'findings': self.ws.findings(), 'plan': read_json(self.ws.root / 'plan.json', []),
+                'evidence': read_json(self.ws.root / 'evidence.json', {}),
+                'current_process_jobs': [j.record() for j in self.jobs.jobs.values()]}
         out = self.ws.root / f'report_{stamp}'
         atomic_json(out.with_suffix('.json'), data)
-        lines = [f'# SecAssist assessment: {self.ws.target}', '', f"Generated: {data['generated_utc']}", '',
-                 '## Scope', *['- ' + x for x in self.scope.describe()], '',
-                 '## Limitations', 'Automated observations require interpretation. Suspected findings are not confirmed.',
-                 'Missing findings do not imply coverage or absence of vulnerabilities. Review the plan below.',
-                 'Network egress is not sandboxed. Full audit: audit.jsonl; output hashes are recorded.', '',
-                 '## Assessment plan / coverage']
-        lines += [f"- [{x['status']}] {x['question']} — {x.get('evidence', '')}" for x in plan] or ['No assessment plan; coverage unknown.']
-        lines += ['', '## Findings']
-        if not findings:
-            lines += ['No findings recorded; this does not establish absence of vulnerabilities.']
-        for f in findings:
-            lines += ['', f"### #{f['id']} {f['title']}", f"Severity: {f['severity']}; status: {f['status']}",
-                      f"Source: {f['source']}", '', f['description'], '', 'Evidence:', '~~~text', f['evidence'],
-                      '~~~', '', 'Remediation: ' + f['remediation']]
-        lines += ['', '## Evidence inventory']
-        lines += [f"- {p} | SHA256 {meta['sha256']} | {meta.get('status', 'imported/parsed')}" for p, meta in evidence.items()]
-        out.with_suffix('.md').write_text(redact('\n'.join(lines)), encoding='utf-8')
-        print(f'Reports: {out}.md and .json')
+        out.with_suffix('.md').write_text(redact(markdown(data)), encoding='utf-8')
+        # html_page redacts and escapes each value itself; redacting the page would cut through tags.
+        out.with_suffix('.html').write_text(html_page(data), encoding='utf-8')
+        print(f'Reports: {out}.md, .html and .json')
 
     def handle(self, line):
         if not line.startswith('/'):
@@ -316,6 +366,22 @@ class App:
         elif cmd == '/scope': self.scope_cmd(rest)
         elif cmd == '/mode': self.mode(rest)
         elif cmd == '/run': self.run(rest)
+        elif cmd == '/methodology': self.methodology()
+        elif cmd == '/next': self.next_steps()
+        elif cmd == '/skip':
+            p = rest.split(None, 1)
+            if not p: raise ValueError('/skip STEP [REASON]')
+            self.agent.method.skip(p[0], p[1] if len(p) > 1 else '')
+            ui.ok(f'Skipped {p[0]}; reported as not tested.')
+        elif cmd == '/retry':
+            if not rest: raise ValueError('/retry STEP')
+            self.agent.method.retry(rest)
+            ui.ok(f'{rest} reset; /next runs it when its phase is open.')
+        elif cmd == '/facts':
+            self.agent.method.sync(self.jobs)
+            print('\n'.join(self.agent.method.facts.summary(500)) or 'No services yet; the discovery phase fills this.')
+        elif cmd == '/wordlists':
+            for name, path in wordlists().items(): print(f'{name:<12} {path or "missing"}')
         elif cmd == '/setup': self.setup()
         elif cmd == '/tools': self.tools(rest)
         elif cmd == '/jobs':
@@ -329,7 +395,20 @@ class App:
         elif cmd == '/continue': self.continue_run()
         elif cmd == '/plan': print(json.dumps(self.agent.plan, ensure_ascii=False, indent=2))
         elif cmd == '/findings': print(self.ws.findings_summary())
-        elif cmd == '/confirm': self.ws.confirm(int(rest))
+        elif cmd == '/finding': self.show_finding(int(rest))
+        elif cmd == '/confirm':
+            self.ws.confirm(int(rest))
+            ui.ok(f'Finding #{rest} confirmed by operator.')
+        elif cmd == '/reject':
+            p = rest.split(None, 1)
+            if not p: raise ValueError('/reject ID [REASON]')
+            self.ws.reject(int(p[0]), p[1] if len(p) > 1 else '')
+            ui.ok(f'Finding #{p[0]} rejected as a false positive; kept in the audit trail.')
+        elif cmd == '/severity':
+            p = rest.split()
+            if len(p) != 2: raise ValueError('/severity ID ' + '|'.join(SEVERITIES))
+            self.ws.set_severity(int(p[0]), p[1].lower())
+            ui.ok(f'Finding #{p[0]} severity set to {p[1].lower()}.')
         elif cmd == '/outputs': print('\n'.join(self.ws.list_outputs()) or '(none)')
         elif cmd == '/import':
             p = shlex.split(rest)
@@ -383,11 +462,17 @@ class App:
                 prompt = f'[{self.ws.target}|{self.policy.mode}] you> '
                 if os.name == 'posix' and sys.stdin.isatty():
                     print(prompt, end='', flush=True)
+                    last = 0
                     while not select.select([sys.stdin], [], [], .3)[0]:
-                        if self.completed() and self.policy.mode == 'auto':
-                            print()
-                            self.continue_run()
-                            print(prompt, end='', flush=True)
+                        if self.policy.mode == 'auto' and time.monotonic() - last > 2:
+                            last = time.monotonic()
+                            try:
+                                printed = self.pump()
+                            except (ValueError, OSError) as e:
+                                ui.error('\n' + redact(str(e)))
+                                printed = True
+                            if printed:
+                                print(prompt, end='', flush=True)
                     line = sys.stdin.readline()
                     if not line: break
                     line = line.strip()
@@ -412,7 +497,7 @@ def viewer(args):
         if args.viewer == 'status':
             while True:
                 data = read_json(root / 'jobs.json', [])
-                print('\033[2J\033[H' + 'SecAssist — jobs / المهام\n' +
+                print('\033[2J\033[H' + 'SecAssist — jobs\n' +
                       '\n'.join(f"{x['id']}  {x['tool']:<20} {x['status']}  exit={x['returncode']}" for x in data),
                       flush=True)
                 for step in read_json(root / 'plan.json', []):

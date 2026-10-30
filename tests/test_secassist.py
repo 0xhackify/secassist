@@ -17,6 +17,7 @@ from core.client import ChatClient, APIError
 from core.jobs import JobManager
 from core.notes import NotesIndex
 from core.policy import Policy, Action
+from core.report import html_page, markdown
 from core.scope import Scope
 from core.storage import atomic_json, inside
 from core.tools import REGISTRY, risk_for
@@ -173,6 +174,75 @@ class PolicyTests(Base):
         with self.assertRaises(ValueError):
             self.agent.run({'tool': 'nmap', 'args': ['192.0.2.10']})
 
+    def wordlist(self):
+        path = self.ws.root / 'words.txt'
+        path.write_text('admin\n')
+        return str(path)
+
+    def test_rate_caps_require_review(self):
+        words = self.wordlist()
+        self.policy.grant('active')
+        fast = self.validate('ffuf', ['-u', 'https://example.test/FUZZ', '-w', words, '-t', '1000'])
+        self.assertFalse(self.policy.auto_allows(fast))
+        normal = self.validate('ffuf', ['-u', 'https://example.test/FUZZ', '-w', words, '-t', '40'])
+        self.assertTrue(self.policy.auto_allows(normal))
+        # Zero often means unlimited; non-numeric values cannot be compared.
+        for value in ('5000', '0', 'fast', 'nan'):
+            with self.subTest(value=value):
+                self.assertTrue(self.validate('nmap', ['--min-rate', value, '192.0.2.10']).warnings)
+
+    def test_whatweb_aggression_raises_risk(self):
+        self.assertEqual(self.validate('whatweb', ['-a', '1', 'https://example.test']).risk, 'recon')
+        self.assertEqual(self.validate('whatweb', ['-a', '3', 'https://example.test']).risk, 'active')
+
+    def test_short_flags_are_blocked_per_tool(self):
+        words = self.wordlist()
+        # The same letters stay blocked where they proxy traffic, load templates, follow redirects or read lists.
+        for name, args in (('curl', ['-x', 'http://192.0.2.10:8080', 'https://example.test']),
+                           ('nuclei', ['-t', 'custom.yaml', '-u', 'https://example.test']),
+                           ('gobuster', ['dir', '-u', 'https://example.test', '-w', words, '-r']),
+                           ('dirsearch', ['-l', 'urls.txt'])):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.validate(name, args)
+        self.validate('hydra', ['-l', 'admin', '-P', '/usr/share/wordlists/rockyou.txt', 'ssh://192.0.2.10'])
+        self.validate('dirsearch', ['-u', 'https://example.test', '-e', 'php', '-x', '404', '-t', '20'])
+
+    def test_reviewed_profiles_allow_unattended_use(self):
+        words = self.wordlist()
+        self.policy.grant('active')
+        for name, args in (
+                ('gobuster', ['dir', '-u', 'https://example.test', '-w', words, '-x', 'php', '-t', '50', '-q']),
+                ('dirsearch', ['-u', 'https://example.test', '-w', words, '-e', 'php', '-r']),
+                ('wafw00f', ['-r', 'https://example.test']),
+                ('enum4linux-ng', ['-A', '192.0.2.10']),
+                ('smbclient', ['-N', '-L', '//192.0.2.10']),
+                ('ldapsearch', ['-x', '-H', 'ldap://192.0.2.10', '-s', 'base', 'namingcontexts'])):
+            with self.subTest(name=name):
+                action = self.validate(name, args)
+                self.assertEqual(action.warnings, [])
+                self.assertTrue(self.policy.auto_allows(action))
+
+    def test_profiles_keep_scope_and_state_changes_reviewed(self):
+        for name, args in (('ldapsearch', ['-x', '-H', 'ldap://203.0.113.10']),
+                           ('smbclient', ['-N', '-L', '//203.0.113.10']),
+                           ('gobuster', ['dns', '--domain', 'other.test'])):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.validate(name, args)
+        shell = self.validate('smbclient', ['-N', '//192.0.2.10/share', '-c', 'put local.txt'])
+        self.assertEqual(shell.risk, 'intrusive')
+        self.assertTrue(shell.warnings)
+        self.assertTrue(self.validate('wafw00f', ['https://example.test']).warnings)
+        self.assertEqual(self.validate('enum4linux-ng', ['-A', '-R', '192.0.2.10']).warnings,
+                         ['Option outside reviewed profile: -R'])
+
+    def test_nmap_accepts_normalized_targets(self):
+        self.scope.add('192.0.2.0/28')
+        for args in (['-sV', 'EXAMPLE.test'], ['-sV', '192.0.2.5/28']):
+            with self.subTest(args=args):
+                self.assertEqual(self.validate('nmap', args).warnings, [])
+        with self.assertRaises(ValueError):
+            self.validate('nmap', ['-sV', 'https://example.test'])
+
 
 class EvidenceTests(Base):
     def test_sibling_prefix_and_traversal_rejected(self):
@@ -225,6 +295,28 @@ class EvidenceTests(Base):
         output.write_text('changed')
         with self.assertRaises(ValueError):
             self.ws.add_finding('Changed', 'info', 'changed', source=source)
+
+    def test_operator_finding_decisions(self):
+        output = self.ws.outputs / 'banner.txt'
+        output.write_text('Server: Apache/2.4.49\n')
+        source = self.ws.register(output)
+        item = self.ws.add_finding('Outdated Apache', 'medium', 'Apache/2.4.49', source=source)
+        self.ws.set_severity(item['id'], 'high')
+        self.ws.reject(item['id'], 'Backported patch confirmed by owner')
+        stored = self.ws.finding(item['id'])
+        self.assertEqual((stored['severity'], stored['status']), ('high', 'rejected'))
+        self.assertEqual(stored['rejection'], 'Backported patch confirmed by owner')
+        self.assertEqual(len(self.ws.findings()), 1)
+        with self.assertRaises(ValueError):
+            self.ws.set_severity(item['id'], 'urgent')
+        with self.assertRaises(ValueError):
+            self.ws.reject(99)
+        self.assertTrue(self.ws.evidence_intact(source))
+        output.write_text('changed')
+        self.assertFalse(self.ws.evidence_intact(source))
+        events = [json.loads(x)['event'] for x in (self.ws.root / 'audit.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertIn('finding_rejected', events)
+        self.assertIn('finding_severity_changed', events)
 
 
 class JobTests(Base):
@@ -282,6 +374,12 @@ class JobTests(Base):
         self.assertEqual(job.status, 'output_limit')
         self.assertLess(job.path.stat().st_size, 1000)
 
+    def test_ldapsearch_ignores_user_ldap_config(self):
+        tool = SimpleNamespace(name='ldapsearch', binary=lambda: sys.executable, timeout=5)
+        job = self.jobs.submit(Action(tool, ['-u', '-c', "import os; print(os.environ.get('LDAPNOINIT'))"], [], 'active'))
+        self.assertTrue(job.done.wait(5))
+        self.assertEqual(job.tail.strip(), '1')
+
     def test_api_key_not_in_tool_environment(self):
         with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'fake-test-key'}):
             job = self.launch("import os; print(os.environ.get('DEEPSEEK_API_KEY', 'absent'))")
@@ -314,6 +412,22 @@ class StreamTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ChatClient('http://remote.test', 'fake', 'fake')
 
+    def test_non_thinking_mode_uses_repeatable_sampling(self):
+        payload = ChatClient('https://api.deepseek.com', 'fake', 'fake', 'off')._payload([], None)
+        self.assertEqual(payload['temperature'], 0)
+
+
+class LanguageTests(unittest.TestCase):
+    def test_interface_and_docs_are_english(self):
+        files = [ROOT / 'secassist.py', ROOT / 'README.md', *sorted((ROOT / 'core').glob('*.py')),
+                 *sorted((ROOT / 'docs').glob('*.md'))]
+        for path in files:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding='utf-8')
+                self.assertFalse(any('\u0600' <= c <= '\u06ff' for c in text))
+        from core.prompts import SYSTEM_PROMPT
+        self.assertIn('Always reply in English', SYSTEM_PROMPT)
+
 
 class AgentIntegrationTests(Base):
     def test_model_tool_call_crosses_approval_then_completion_is_analyzed(self):
@@ -343,13 +457,71 @@ class AgentIntegrationTests(Base):
             self.agent.dispatch('set_scope', {'scope': ['0.0.0.0/0']})
         self.assertFalse(self.scope.allows('203.0.113.10'))
 
+    def model_calls(self, *calls):
+        self.agent.client = SimpleNamespace(api_key='fake', chat=unittest.mock.Mock(
+            return_value={'role': 'assistant', 'content': '', 'tool_calls': list(calls)}))
+
+    def test_interrupted_edit_leaves_no_unanswered_tool_call(self):
+        self.model_calls({'id': 'edit-call', 'type': 'function',
+                          'function': {'name': 'run_tool', 'arguments': json.dumps(self.card())}})
+
+        def ask(prompt, prefill=''):
+            if prompt.startswith('edit>'):
+                raise KeyboardInterrupt
+            return 'e'
+        with patch('core.ui.ask', side_effect=ask), patch.object(self.jobs, 'submit') as submit:
+            self.agent.turn('Scan the host')
+        submit.assert_not_called()
+        self.assertTrue(self.agent.stopped)
+        replies = [m['tool_call_id'] for m in self.agent.turns[-1] if m.get('role') == 'tool']
+        self.assertEqual(replies, ['edit-call'])
+
+    def test_interrupt_anywhere_answers_pending_calls(self):
+        # Otherwise the API rejects every later request in this conversation.
+        self.model_calls(*[{'id': f'call-{i}', 'type': 'function',
+                            'function': {'name': 'search_notes', 'arguments': '{"query": "x"}'}} for i in range(2)])
+        with patch.object(self.agent, 'dispatch', side_effect=KeyboardInterrupt):
+            self.agent.turn('Search notes')
+        replies = {m['tool_call_id'] for m in self.agent.turns[-1] if m.get('role') == 'tool'}
+        self.assertEqual(replies, {'call-0', 'call-1'})
+
+
+class ReportTests(unittest.TestCase):
+    def data(self):
+        base = {'source': 'outputs/a.txt', 'description': 'Observed.', 'remediation': 'Patch.', 'evidence': 'quote'}
+        return {'target': 'example.test', 'scope': ['example.test'], 'generated_utc': '2026-10-30T00:00:00+00:00',
+                'plan': [{'question': 'Is HTTP exposed?', 'status': 'supported', 'evidence': 'outputs/a.txt'}],
+                'evidence': {'outputs/a.txt': {'sha256': 'ab' * 32, 'status': 'completed'}},
+                'findings': [
+                    {**base, 'id': 1, 'title': 'Low thing', 'severity': 'low', 'status': 'suspected',
+                     'evidence': '<script>alert(1)</script> Authorization: Bearer abc123'},
+                    {**base, 'id': 2, 'title': 'Critical thing', 'severity': 'critical', 'status': 'user_confirmed'},
+                    {**base, 'id': 3, 'title': 'Noise', 'severity': 'high', 'status': 'rejected',
+                     'rejection': 'false positive per owner'}],
+                'current_process_jobs': []}
+
+    def test_html_escapes_untrusted_evidence(self):
+        page = html_page(self.data())
+        self.assertNotIn('<script>', page)
+        self.assertIn('&lt;script&gt;', page)
+        self.assertNotIn('abc123', page)
+        self.assertIn("default-src 'none'", page)
+
+    def test_severity_order_and_rejected_section(self):
+        for name, text in (('markdown', markdown(self.data())), ('html', html_page(self.data()))):
+            with self.subTest(name=name):
+                self.assertLess(text.index('Critical thing'), text.index('Low thing'))
+                self.assertLess(text.index('Low thing'), text.index('Noise'))
+                self.assertIn('false positive per owner', text)
+
 
 class CLITests(unittest.TestCase):
     def test_offline_workflow_and_report(self):
         with tempfile.TemporaryDirectory() as temp:
             fixture = Path(temp) / 'evidence.txt'
             fixture.write_text('observed fixture only')
-            commands = '/scope add example.test\n/target example.test\n/import "' + fixture.as_posix() + '"\n/report\n/exit\n'
+            commands = ('/scope add example.test\n/target example.test\n/import "' + fixture.as_posix() + '"\n'
+                        '/finding 1\n/report\n/exit\n')
             env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
             env.pop('DEEPSEEK_API_KEY', None)
             result = subprocess.run([sys.executable, str(ROOT / 'secassist.py'), '--data', temp],
@@ -357,15 +529,17 @@ class CLITests(unittest.TestCase):
                                     env=env, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Reports:', result.stdout)
+            self.assertIn('Unknown finding ID', result.stdout)
             reports = list(Path(temp).rglob('report_*.json'))
             self.assertTrue(reports)
             self.assertEqual(json.loads(reports[0].read_text())['target'], 'example.test')
+            self.assertTrue(list(Path(temp).rglob('report_*.html')))
 
     def test_version_without_api_key(self):
         result = subprocess.run([sys.executable, str(ROOT / 'secassist.py'), '--version'],
                                 text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0)
-        self.assertIn('3.0.0', result.stdout)
+        self.assertIn('3.2.0', result.stdout)
 
 
 if __name__ == '__main__':

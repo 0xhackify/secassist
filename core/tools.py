@@ -53,7 +53,7 @@ REGISTRY = {t.name: t for t in [
     _t("nslookup", "dns", "recon", "DNS lookup.", "dnsutils", timeout=60),
     _t("whois", "dns", "recon", "WHOIS lookup of a domain/IP.", "whois", timeout=60),
     _t("whatweb", "web", "recon", "Fingerprint web technologies: ['-a','1','http://<host>'].", "whatweb", timeout=300),
-    _t("wafw00f", "web", "recon", "Detect a WAF in front of a site.", "wafw00f", timeout=300),
+    _t("wafw00f", "web", "recon", "Detect a WAF in front of a site: ['-r','http://<host>'] (-r: no redirects).", "wafw00f", timeout=300),
     _t("curl", "web", "recon", "Raw HTTP requests. Use ['-sik','http://...'] to see headers.", "curl", timeout=120),
     _t("httpx", "web", "recon", "Probe web servers for title/status/tech (projectdiscovery httpx).", "httpx-toolkit", binaries=("httpx-toolkit",), timeout=600),
     _t("sslscan", "web", "recon", "TLS/SSL configuration check.", "sslscan", timeout=300),
@@ -125,7 +125,17 @@ def risk_for(tool, args):
         risk = 'intrusive'
     if tool.name in ('nuclei', 'impacket-GetNPUsers', 'impacket-GetUserSPNs', 'onesixtyone'):
         risk = 'intrusive'
-    if tool.name in ('rpcclient', 'smbclient', 'netexec'):
+    if tool.name == 'whatweb':
+        for i, a in enumerate(args):
+            key, _, value = a.partition('=')
+            if key in ('-a', '--aggression'):
+                value = value or (args[i + 1] if i + 1 < len(args) else '')
+                if value not in ('1', '2'):
+                    risk = 'active'  # aggression 3/4 sends many extra requests
+    # Share listing is read-only; commands, tar and directory operations can change state.
+    listing = tool.name == 'smbclient' and '-L' in args and not any(
+        a.split('=', 1)[0] in ('-c', '--command', '-T', '--tar', '-D', '--directory') for a in args)
+    if tool.name in ('rpcclient', 'smbclient', 'netexec') and not listing:
         risk = 'intrusive'  # these clients can change state or execute operations
     return risk
 
@@ -134,11 +144,12 @@ def risk_for(tool, args):
 # Running commands
 # ----------------------------------------------------------------------------
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
-NOISE_RE = re.compile(r"^\s*(:: Progress:|Progress:|\[#+|\[\s*\d+/\d+\]\s*\[)", re.I)
+# ffuf/gobuster "Progress:", bar drawings ([####], [>----] - 3s), counters ([12/400] [) and "42.5% |" lines.
+NOISE_RE = re.compile(r"^\s*(:: Progress:|Progress:|\[#+|\[[#>=\-.\s]*\]\s*-|\[\s*\d+/\d+\]\s*\[|\d+(\.\d+)?%\s*\|)", re.I)
 
 
 def clean_output(text):
-    """Remove colors, progress bars and repeated lines so the model gets less noise."""
+    """Model-facing view: remove colors, progress bars and repeated lines. Evidence files stay unchanged."""
     out, last = [], None
     for line in text.splitlines():
         line = ANSI_RE.sub("", line)

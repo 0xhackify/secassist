@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from .storage import atomic_json, redact
-from .tools import prepare_args, parse_nmap_xml
+from .tools import clean_output, prepare_args, parse_nmap_xml
 
 MAX_LOG = 16 * 1024 * 1024
 MAX_TAIL = 16000
@@ -81,7 +81,7 @@ class JobManager:
                 raise ValueError('Concurrency limit reached; wait for or stop a job')
             jid = uuid.uuid4().hex[:10]
             path = self.ws.outputs / f'{action.tool.name}_{jid}.txt'
-            job = Job(jid, action.tool.name, action.args[:], path)
+            job = Job(jid, action.tool.name, action.args + list(action.defaults), path)
             self.jobs[jid] = job
             path.touch(mode=0o600)
             self._write()
@@ -111,6 +111,9 @@ class JobManager:
             env = {k: v for k, v in os.environ.items() if not any(
                 word in k.upper() for word in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'PROXY'))}
             env.update(PAGER='cat', GIT_PAGER='cat', TERM='dumb', NO_COLOR='1')
+            # Like curl -q: ldaprc/ldap.conf could otherwise supply a hidden URI or bind settings.
+            if tool.name == 'ldapsearch':
+                env['LDAPNOINIT'] = '1'
             kwargs = {'start_new_session': True} if os.name == 'posix' else {
                 'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
             if job.cancel.is_set():
@@ -140,7 +143,8 @@ class JobManager:
                     chunk = os.read(proc.stdout.fileno(), 4096)
                     if not chunk:
                         break
-                    text = redact(decoder.decode(chunk))
+                    # Progress bars redraw with \r; as newlines they stay separate from result lines.
+                    text = redact(decoder.decode(chunk).replace('\r\n', '\n').replace('\r', '\n'))
                     count += len(chunk)
                     if count > MAX_LOG:
                         job.status = 'output_limit'
@@ -191,7 +195,7 @@ class JobManager:
     def result(self, jid):
         job = self.get(jid)
         return json.dumps({**job.record(), 'source': job.path.relative_to(self.ws.root).as_posix(),
-                           'summary': job.summary, 'output_tail': job.tail}, ensure_ascii=False)
+                           'summary': job.summary, 'output_tail': clean_output(job.tail)}, ensure_ascii=False)
 
     def stop(self, jid='all'):
         jobs = self.active() if jid == 'all' else [self.get(jid)]

@@ -4,7 +4,12 @@
 Develop the supplied CLI into an evidence-led, operator-controlled Kali assistant.
 Windows is supported for local review/testing, not as a replacement for Kali tools.
 
-- secassist.py: human-only commands, configuration, reports, automatic completion pump.
+- secassist.py: human-only commands, configuration, finding decisions, automatic completion pump.
+- core/report.py: local Markdown/HTML reports; HTML escapes untrusted evidence and carries a no-script CSP.
+- core/methodology.py: fixed phases and data-defined service playbooks; computes steps, order and status
+  deterministically from the target, facts and installed tools; records step state and coverage.
+- core/facts.py: service inventory merged from managed nmap XML; the only input to playbook selection.
+- core/toolcheck.py: installed help-text flag checks, managed non-interactive defaults, wordlist discovery.
 - core/agent.py: conversation/tool protocol, decision cards, approval loop, plan and findings dispatch.
 - core/prompts.py: assessment methodology and evidence/uncertainty instructions.
 - core/policy.py: registered tools, risk ceilings, reviewed arguments, scope checks, approval grants.
@@ -17,6 +22,12 @@ Windows is supported for local review/testing, not as a replacement for Kali too
 - core/tools.py: registry, risk classification, nmap argument preparation and XML parsing.
 - core/notes.py: local notes search; returned content is untrusted.
 
+## Methodology flow
+nmap XML -> facts -> playbook steps (fixed order) -> phase gate -> validate -> approval or grant -> job ->
+sync on completion -> facts and step status -> model analysis and findings -> next ready steps.
+Playbook steps, policy decisions and coverage are deterministic; model wording is not, and model
+proposals are a separate, always-approved off-methodology path.
+
 ## Permission flow
 Human objective -> model decision card -> validate tool/args/scope -> human approval or live grant ->
 revalidate -> JobManager starts process -> live file + audit -> completion event ->
@@ -25,6 +36,9 @@ model analysis/plan update -> suspected finding with exact registered evidence -
 Auto grants bind risk ceiling, scope revision, expiry and remaining launches.
 Grants never persist. File imports and scope changes are human-only commands.
 Unknown CLI options require human review; selected indirect/config/output/execution routes are blocked.
+Ambiguous short flags are blocked unless a tool is listed with a reviewed meaning for that flag.
+Thread/rate values above per-tool ceilings need review, so a grant cannot launch unbounded fan-out.
+An interrupted turn answers every pending tool call so the API conversation stays valid.
 An unsafe native tool or default configuration can still escape semantic intent: no egress sandbox.
 
 ## Persistence
@@ -46,4 +60,5 @@ Shutdown stops jobs before saving the session and closes only owned tmux panes.
 Tests use instrumented tool substitutes and harmless local Python processes.
 They cover modes, edited-command reapproval, scope bypass attempts, evidence integrity,
 session sanitization, timeout/cancellation/descendants, concurrent task limits, API truncation,
-offline reports and real tmux pane lifecycle with an isolated server.
+interrupted turns, rate ceilings, per-tool flags and profiles, operator finding decisions,
+offline Markdown/HTML reports with hostile evidence, and real tmux pane lifecycle with an isolated server.
