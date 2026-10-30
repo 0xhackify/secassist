@@ -1,0 +1,16 @@
+# Legacy/example scope file. SecAssist 3 uses /scope add in the terminal.
+# Optional reviewed import: /scope import scope.txt
+# One entry per line. Lines starting with # are comments.
+#
+# Supported formats:
+#   10.10.11.23          single IP
+#   10.10.10.0/24        network (CIDR)
+#   target.htb           exact domain
+#   *.target.htb         domain and all its subdomains
+#
+# Remove the # in front of a line only when you are authorized to test it.
+
+# Hack The Box lab (only while connected to the HTB VPN):
+# 10.10.10.0/23
+# 10.129.0.0/16
+# *.htb

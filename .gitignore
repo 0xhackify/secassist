@@ -1,0 +1,22 @@
+# Private assessment data
+.secassist/
+workspace/
+outputs/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pcap
+*.pcapng
+# Python/editors
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
